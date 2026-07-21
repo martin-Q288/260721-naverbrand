@@ -126,9 +126,10 @@
       <label>상세페이지 스크린샷 <span style="color:var(--muted)">(제품명·평점·리뷰수·가격·스펙 화면)</span></label>
       <div class="dropzone" id="dropzone">
         📷 클릭하거나 이미지를 끌어다 놓으세요<br>
-        <span style="font-size:11.5px">여러 장 가능 · PNG/JPG</span>
+        <span style="font-size:11.5px">여러 장 가능 · 업로드 시 자동 최적화 · 작업 자동 저장</span>
       </div>
       <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+      <div id="imgMeta" class="hint" style="display:none; margin-top:8px;"></div>
       <div class="thumbs" id="thumbs"></div>
 
       <label>모드</label>
@@ -293,7 +294,7 @@ document.getElementById("settings").addEventListener("click", e=>{ if(e.target.i
 function initSeg(id){
   const seg = document.getElementById(id);
   seg.querySelectorAll("button").forEach(b=>{
-    b.onclick = ()=>{ seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); };
+    b.onclick = ()=>{ seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); saveState(); };
   });
 }
 function segValue(id){ return document.getElementById(id).querySelector("button.on").dataset.v; }
@@ -308,21 +309,50 @@ fileInput.onchange = ()=> handleFiles(fileInput.files);
 ["dragleave","drop"].forEach(ev=> dropzone.addEventListener(ev, e=>{ e.preventDefault(); dropzone.classList.remove("drag"); }));
 dropzone.addEventListener("drop", e=> handleFiles(e.dataTransfer.files));
 
-function handleFiles(files){
-  [...files].forEach(file=>{
-    if(!file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = ()=>{
-      const dataUrl = reader.result;
-      const base64 = dataUrl.split(",")[1];
-      let mt = file.type;
-      if(mt === "image/jpg") mt = "image/jpeg";
-      if(!["image/png","image/jpeg","image/gif","image/webp"].includes(mt)) mt = "image/png";
-      IMAGES.push({ media_type: mt, data: base64, url: dataUrl });
-      renderThumbs();
+const MAX_EDGE = 1568; // 클로드 비전 최적 긴 변(px). 이보다 크면 축소.
+const JPEG_Q = 0.82;
+
+const THUMB_EDGE = 260; // 화면 표시용 썸네일 긴 변(px)
+
+function drawScaled(im, maxEdge, quality){
+  let w = im.width, h = im.height;
+  const scale = Math.min(1, maxEdge / Math.max(w, h));
+  w = Math.round(w * scale); h = Math.round(h * scale);
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  cv.getContext("2d").drawImage(im, 0, 0, w, h);
+  return cv.toDataURL("image/jpeg", quality);
+}
+// 원본을 (1) API용 1568px JPEG (2) 표시용 소형 썸네일 로 각각 만들어 저장.
+// → 큰 비트맵을 화면에 띄우지 않아 사파리 탭 강제종료를 막고, 전송량도 대폭 절감.
+function resizeImage(file){
+  return new Promise((resolve, reject)=>{
+    const objUrl = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = ()=>{
+      try{
+        const full = drawScaled(im, MAX_EDGE, JPEG_Q);
+        const thumb = drawScaled(im, THUMB_EDGE, 0.7);
+        URL.revokeObjectURL(objUrl); // 원본 즉시 메모리 해제
+        resolve({ media_type:"image/jpeg", data: full.split(",")[1], url: thumb });
+      }catch(err){ URL.revokeObjectURL(objUrl); reject(err); }
     };
-    reader.readAsDataURL(file);
+    im.onerror = ()=>{ URL.revokeObjectURL(objUrl); reject(new Error("이미지를 읽지 못했습니다")); };
+    im.src = objUrl;
   });
+}
+
+// 순차 처리(한 번에 하나씩 디코딩) → 메모리 스파이크 방지
+async function handleFiles(files){
+  const list = [...files].filter(f=> f.type.startsWith("image/"));
+  if(!list.length) return;
+  setStatus('<span class="spinner"></span>이미지 최적화 중… (' + list.length + '장)', "busy");
+  for(const file of list){
+    try{ IMAGES.push(await resizeImage(file)); renderThumbs(); }
+    catch(e){ /* 개별 이미지 실패는 건너뜀 */ }
+  }
+  setStatus("", "");
+  await saveState();
 }
 function renderThumbs(){
   const box = document.getElementById("thumbs");
@@ -333,8 +363,73 @@ function renderThumbs(){
     div.innerHTML = `<img src="${img.url}"><button onclick="removeImg(${i})">×</button>`;
     box.appendChild(div);
   });
+  const meta = document.getElementById("imgMeta");
+  if(IMAGES.length){
+    const kb = Math.round(IMAGES.reduce((s,x)=> s + x.data.length*0.75, 0) / 1024);
+    meta.style.display = "block";
+    meta.innerHTML = `스크린샷 <b>${IMAGES.length}</b>장 · 약 ${kb >= 1024 ? (kb/1024).toFixed(1)+"MB" : kb+"KB"} `
+      + `<a href="#" onclick="clearImages(event)" style="color:var(--err); margin-left:6px;">전체 지우기</a>`;
+  }else{
+    meta.style.display = "none";
+  }
 }
-function removeImg(i){ IMAGES.splice(i,1); renderThumbs(); }
+async function removeImg(i){ IMAGES.splice(i,1); renderThumbs(); await saveState(); }
+async function clearImages(e){ if(e) e.preventDefault(); IMAGES = []; renderThumbs(); await saveState(); }
+
+/* ================= 자동 저장/복원 (IndexedDB) =================
+   사파리가 백그라운드에서 탭을 버렸다가 새로고침해도 이미지·입력이 복원됨. */
+function idb(){
+  return new Promise((res, rej)=>{
+    const r = indexedDB.open("blogPipeline", 1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore("kv");
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function idbSet(key, val){
+  try{
+    const db = await idb();
+    await new Promise((res, rej)=>{
+      const tx = db.transaction("kv", "readwrite");
+      tx.objectStore("kv").put(val, key);
+      tx.oncomplete = res; tx.onerror = ()=> rej(tx.error);
+    });
+  }catch(e){ /* 저장 실패는 조용히 무시(브라우저 제한 등) */ }
+}
+async function idbGet(key){
+  try{
+    const db = await idb();
+    return await new Promise((res, rej)=>{
+      const tx = db.transaction("kv", "readonly");
+      const g = tx.objectStore("kv").get(key);
+      g.onsuccess = ()=> res(g.result); g.onerror = ()=> rej(g.error);
+    });
+  }catch(e){ return undefined; }
+}
+
+const FORM_FIELDS = ["url","price","dupes","notes"];
+let saveTimer = null;
+async function saveState(){
+  const state = {
+    images: IMAGES,
+    fields: Object.fromEntries(FORM_FIELDS.map(id=> [id, document.getElementById(id).value])),
+    mode: segValue("modeSeg"),
+    time: segValue("timeSeg"),
+    useSearch: document.getElementById("useSearch").checked
+  };
+  await idbSet("state", state);
+}
+function saveStateDebounced(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveState, 400); }
+async function restoreState(){
+  const s = await idbGet("state");
+  if(!s) return;
+  if(Array.isArray(s.images)){ IMAGES = s.images; renderThumbs(); }
+  if(s.fields) FORM_FIELDS.forEach(id=>{ if(s.fields[id] != null) document.getElementById(id).value = s.fields[id]; });
+  const pick = (segId, v)=>{ const seg = document.getElementById(segId); const b = seg.querySelector(`button[data-v="${v}"]`); if(b){ seg.querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); } };
+  if(s.mode) pick("modeSeg", s.mode);
+  if(s.time) pick("timeSeg", s.time);
+  if(typeof s.useSearch === "boolean") document.getElementById("useSearch").checked = s.useSearch;
+}
 
 /* ================= 프롬프트 조립 ================= */
 function buildUserPrompt(){
@@ -513,7 +608,12 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(()=> t.classList.remove("show"), 1800);
 }
 
+// 입력 변경 시 자동 저장 + 복원
+FORM_FIELDS.forEach(id=> document.getElementById(id).addEventListener("input", saveStateDebounced));
+document.getElementById("useSearch").addEventListener("change", saveState);
+
 loadSettings();
+restoreState();
 </script>
 </body>
 </html>
