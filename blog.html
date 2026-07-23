@@ -582,7 +582,10 @@ async function callClaude(userPrompt, opts){
   let data;
   // 서버 툴(검색·페치)을 많이 쓰면 stop_reason=pause_turn으로 멈출 수 있음 → 이어서 재요청
   for(let round = 0; round < 4; round++){
-    const body = { model, max_tokens: 8000, system: opts.system || SYSTEM_RULES, messages };
+    // max_tokens 넉넉히(원고+검색 여유). '생각'(thinking)은 예산만 소모하고 원고엔 불필요하므로 끔.
+    // 단, claude-fable-5는 thinking:disabled가 400이라 제외.
+    const body = { model, max_tokens: 16000, system: opts.system || SYSTEM_RULES, messages };
+    if(model !== "claude-fable-5") body.thinking = { type: "disabled" };
     if(tools.length) body.tools = tools;
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST", headers, body: JSON.stringify(body)
@@ -598,7 +601,11 @@ async function callClaude(userPrompt, opts){
     setStatus('<span class="spinner"></span>리서치 계속 진행 중… (' + (round+2) + '차)', "busy");
   }
   const text = (data.content || []).filter(b=>b.type==="text").map(b=>b.text).join("");
-  if(!text) throw new Error("응답이 비어 있습니다 (stop_reason: " + (data.stop_reason||"불명") + "). 다시 시도해 보세요.");
+  if(!text){
+    const sr = data.stop_reason || "불명";
+    if(sr === "max_tokens") throw new Error("본문을 쓰기 전 토큰 한도에 걸렸어요. '웹 리서치 사용'을 끄거나, API 설정에서 더 빠른 모델(Haiku 4.5)로 바꾼 뒤 다시 시도해 보세요.");
+    throw new Error("응답이 비어 있습니다 (stop_reason: " + sr + "). 다시 시도해 보세요.");
+  }
   return text;
 }
 
